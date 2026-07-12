@@ -32,7 +32,7 @@ WEB_SERVER_URL = "http://127.0.0.1:5000"
 def resolve_tenant_info(agent_name, default_chat_id):
     try:
         url = "%s/api/telegram-lookup-agent/%s" % (WEB_SERVER_URL, agent_name)
-        resp = requests.get(url, timeout=3, headers={'X-Integration-Secret': '3818e0cdd3a05445dd69d5780c3fa7120b945ee14041913bbd87dde3cc2d4c7c'})
+        resp = requests.get(url, timeout=3, headers={'X-Integration-Secret': 'ISI SECRET'})
         if resp.status_code == 200:
             data = resp.json()
             if data.get("chat_id"):
