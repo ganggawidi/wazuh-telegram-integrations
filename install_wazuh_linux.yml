@@ -1,0 +1,217 @@
+---
+- name: Install Wazuh Agent on Linux (Ubuntu)
+  hosts: target
+  become: yes
+  vars:
+    ansible_become_timeout: 60
+    wazuh_manager_ip: "37.60.246.175"
+    wazuh_agent_version: "4.14.5-1"
+    agent_name: "default-agent"
+
+  tasks:
+    - name: Kill apt lock processes and disable background updaters
+      shell: |
+        systemctl stop unattended-upgrades apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+        systemctl kill --kill-who=all apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+        pkill -9 -f unattended-upgrades 2>/dev/null || true
+        sleep 2
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Install required packages
+      apt:
+        name:
+          - curl
+          - apt-transport-https
+          - gnupg
+        state: present
+        update_cache: no
+        lock_timeout: 120
+
+    - name: Download Wazuh GPG key
+      shell: curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | gpg --dearmor -o /usr/share/keyrings/wazuh-archive-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/wazuh-archive-keyring.gpg
+
+    - name: Add Wazuh repository
+      apt_repository:
+        repo: "deb [signed-by=/usr/share/keyrings/wazuh-archive-keyring.gpg] https://packages.wazuh.com/4.x/apt/ stable main"
+        state: present
+        filename: wazuh
+
+    - name: Install Wazuh agent
+      apt:
+        name: "wazuh-agent={{ wazuh_agent_version }}"
+        state: present
+        update_cache: yes
+        lock_timeout: 120
+      environment:
+        WAZUH_MANAGER: "{{ wazuh_manager_ip }}"
+        WAZUH_AGENT_NAME: "{{ agent_name }}"
+
+    - name: Configure Wazuh Manager IP in ossec.conf
+      lineinfile:
+        path: /var/ossec/etc/ossec.conf
+        regexp: '<address>.*</address>'
+        line: '      <address>{{ wazuh_manager_ip }}</address>'
+
+    - name: Enforce agent name and force re-enrollment
+      shell: |
+        # Set agent name in ossec.conf enrollment section
+        if grep -q '<agent_name>' /var/ossec/etc/ossec.conf; then
+          sed -i 's|<agent_name>.*</agent_name>|<agent_name>{{ agent_name }}</agent_name>|' /var/ossec/etc/ossec.conf
+        else
+          sed -i 's|</enrollment>|  <agent_name>{{ agent_name }}</agent_name>\n    </enrollment>|' /var/ossec/etc/ossec.conf
+        fi
+        # Remove old enrollment key to force re-registration with new name
+        rm -f /var/ossec/etc/client.keys
+      changed_when: true
+
+    - name: Enable and start Wazuh agent service
+      systemd:
+        name: wazuh-agent
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for agent to connect
+      pause:
+        seconds: 10
+
+    - name: Verify Wazuh agent is running
+      command: systemctl status wazuh-agent
+      register: agent_status
+      changed_when: false
+
+    - name: Show agent status
+      debug:
+        var: agent_status.stdout_lines
+
+    # -----------------------------------------------------------------------
+    # OTX Realtime Watcher — Hash-based malware detection via AlienVault
+    # Setiap file baru di-hash SHA256 dan di-cek ke OTX API → rule 100060
+    # -----------------------------------------------------------------------
+
+    - name: Install inotify-tools
+      apt:
+        name:
+          - inotify-tools
+        state: present
+        update_cache: no
+        lock_timeout: 60
+      ignore_errors: yes
+
+    - name: Create OTX alert log file
+      file:
+        path: /var/log/wazuh-otx.log
+        state: touch
+        mode: '0644'
+        owner: root
+        group: root
+
+    - name: Deploy OTX realtime watcher script
+      copy:
+        dest: /usr/local/bin/wazuh-otxwatch.sh
+        mode: '0755'
+        owner: root
+        content: |
+          #!/bin/bash
+          # Wazuh OTX Realtime Hash Watcher
+          # Setiap file baru di /tmp /home /var/www/html:
+          #   Query SHA256 ke OTX AlienVault API → log ke /var/log/wazuh-otx.log → rule 100060
+          # Catatan: /var/www/html hanya dimonitor jika direktori sudah ada di server
+
+          OTX_LOG=/var/log/wazuh-otx.log
+          OTX_KEY="abb571f4c8c97da43499a05871ad5fb9779d225956edcd8cb2c7d306098a1abc"
+          OTX_MIN_PULSES=2
+          WATCH_DIRS="/tmp /home"
+
+          # Tambahkan /var/www/html hanya jika direktori sudah ada
+          [ -d "/var/www/html" ] && WATCH_DIRS="$WATCH_DIRS /var/www/html"
+
+          inotifywait -m -q -e create,moved_to,close_write -r $WATCH_DIRS 2>/dev/null |
+          while read dirpath event filename; do
+              fullpath="${dirpath}${filename}"
+              [ -f "$fullpath" ] || continue
+
+              # OTX: query hash ke AlienVault (file >= 100 bytes)
+              SIZE=$(stat -c%s "$fullpath" 2>/dev/null || echo 0)
+              if [ "$SIZE" -ge 100 ] 2>/dev/null; then
+                  SHA256=$(sha256sum "$fullpath" 2>/dev/null | awk '{print $1}')
+                  MD5=$(md5sum "$fullpath" 2>/dev/null | awk '{print $1}')
+                  [ -z "$SHA256" ] && continue
+
+                  RESPONSE=$(curl -sk --max-time 5 \
+                      -H "X-OTX-APIKEY: $OTX_KEY" \
+                      "https://otx.alienvault.com/api/v1/indicators/file/$SHA256/general" 2>/dev/null)
+
+                  PULSE_COUNT=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('pulse_info',{}).get('count',0))" 2>/dev/null)
+
+                  if echo "$PULSE_COUNT" | grep -qE '^[0-9]+$' && \
+                     [ "$PULSE_COUNT" -ge "$OTX_MIN_PULSES" ] 2>/dev/null; then
+                      MALWARE=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); p=d.get('pulse_info',{}).get('pulses',[]); print(p[0].get('name','Unknown') if p else 'Unknown')" 2>/dev/null)
+                      echo "$(date '+%b %d %T') $(hostname) OTX_ALERT: file=$fullpath sha256=$SHA256 md5=$MD5 pulses=$PULSE_COUNT malware=$MALWARE" >> "$OTX_LOG"
+                  fi
+              fi
+          done
+
+    - name: Deploy OTX watcher systemd service
+      copy:
+        dest: /etc/systemd/system/wazuh-otxwatch.service
+        owner: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Wazuh OTX Realtime Hash Watcher
+          After=network.target wazuh-agent.service
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/wazuh-otxwatch.sh
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start OTX watcher
+      systemd:
+        name: wazuh-otxwatch
+        daemon_reload: yes
+        enabled: yes
+        state: started
+      ignore_errors: yes
+
+    - name: Verify OTX watcher is running
+      command: systemctl is-active wazuh-otxwatch
+      register: clamwatch_status
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Show OTX watcher status
+      debug:
+        msg: "OTX watcher: {{ clamwatch_status.stdout | default('N/A') }} | Log: /var/log/wazuh-otx.log"
+
+    # -----------------------------------------------------------------------
+    # Revoke soc-deploy access setelah deploy selesai
+    # -----------------------------------------------------------------------
+
+    - name: Revoke SSH access - remove authorized_keys
+      file:
+        path: /home/soc-deploy/.ssh/authorized_keys
+        state: absent
+      ignore_errors: yes
+
+    - name: Revoke sudo access - remove sudoers file
+      file:
+        path: /etc/sudoers.d/soc-deploy
+        state: absent
+      ignore_errors: yes
+
+    - name: Delete soc-deploy user and home directory
+      command: userdel -r soc-deploy
+      ignore_errors: yes
+
+    - name: Confirm soc-deploy access revoked
+      debug:
+        msg: "Security cleanup complete: SSH key, sudo access removed. soc-deploy user deleted."
