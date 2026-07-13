@@ -1,0 +1,45 @@
+---
+- name: Install Wazuh Agent on Windows
+  hosts: target
+  vars:
+    wazuh_manager_ip: "37.60.246.175"
+    agent_name: "default-agent"
+    wazuh_version: "4.9.0-1"
+
+  tasks:
+    - name: Create temp directory
+      win_file:
+        path: "C:\\Temp"
+        state: directory
+
+    - name: Download Wazuh agent installer
+      win_get_url:
+        url: "https://packages.wazuh.com/4.x/windows/wazuh-agent-{{ wazuh_version }}.msi"
+        dest: "C:\\Temp\\wazuh-agent.msi"
+
+    - name: Install Wazuh agent
+      win_package:
+        path: "C:\\Temp\\wazuh-agent.msi"
+        arguments:
+          - "WAZUH_MANAGER={{ wazuh_manager_ip }}"
+          - "WAZUH_AGENT_NAME={{ agent_name }}"
+        state: present
+
+    - name: Start Wazuh agent service
+      win_service:
+        name: WazuhSvc
+        state: started
+        start_mode: auto
+
+    - name: Wait for agent to connect
+      win_wait_for:
+        timeout: 15
+
+    - name: Verify Wazuh agent service status
+      win_service:
+        name: WazuhSvc
+      register: wazuh_svc
+
+    - name: Show agent service status
+      debug:
+        var: wazuh_svc
